@@ -5,7 +5,8 @@
  * Provides a reusable MQTT v5 client component with topic registration
  * and message routing capabilities.
  * 
- * @author NieRVoid
+ * Updated to support MQTT v5 properties and user properties.
+ * 
  * @date 2025-03-20
  */
 
@@ -13,6 +14,8 @@
 
 #include <stdbool.h>
 #include "esp_err.h"
+#include "mqtt_client.h"
+#include "mqtt5_client.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -69,6 +72,9 @@ typedef struct {
     void *connect_handler_ctx;                 /*!< Connect handler context */
     mqtt_disconnect_handler_t disconnect_handler; /*!< Disconnect event handler or NULL */
     void *disconnect_handler_ctx;              /*!< Disconnect handler context */
+
+    // MQTT v5 properties
+    esp_mqtt5_connection_property_config_t connection_property; /*!< MQTT v5 connection properties */
 } mqtt_manager_config_t;
 
 /**
@@ -91,7 +97,16 @@ typedef struct {
     .connect_handler_ctx = NULL,                    \
     .disconnect_handler = NULL,                     \
     .disconnect_handler_ctx = NULL,                 \
+    .connection_property = {0},                     \
 }
+
+/**
+ * @brief MQTT v5 user property item
+ */
+typedef struct {
+    const char *key;   /*!< User property key */
+    const char *value; /*!< User property value */
+} mqtt_user_property_t;
 
 /**
  * @brief Initialize the MQTT manager
@@ -108,12 +123,17 @@ esp_err_t mqtt_manager_init(const mqtt_manager_config_t *config);
  * @param qos QoS level (0, 1, or 2)
  * @param handler Callback function for incoming messages
  * @param user_data User context passed to the callback
+ * @param user_properties Array of user properties (optional)
+ * @param user_property_count Number of user properties
  * @param handler_id Pointer to store the generated handler ID
  * @return esp_err_t ESP_OK on success, error code otherwise
  */
 esp_err_t mqtt_manager_register_handler(const char *topic, int qos,
                                       mqtt_message_handler_t handler,
-                                      void *user_data, int *handler_id);
+                                      void *user_data,
+                                      const mqtt_user_property_t *user_properties,
+                                      int user_property_count,
+                                      int *handler_id);
 
 /**
  * @brief Unregister a message handler
@@ -131,10 +151,14 @@ esp_err_t mqtt_manager_unregister_handler(int handler_id);
  * @param len Message payload length (use -1 for null-terminated strings)
  * @param qos QoS level (0, 1, or 2)
  * @param retain Retain flag
+ * @param user_properties Array of user properties (optional)
+ * @param user_property_count Number of user properties
  * @return int Message ID on success, negative error code otherwise
  */
 int mqtt_manager_publish(const char *topic, const void *data, int len, 
-                        int qos, int retain);
+                        int qos, int retain,
+                        const mqtt_user_property_t *user_properties,
+                        int user_property_count);
 
 /**
  * @brief Start the MQTT manager

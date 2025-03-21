@@ -6,7 +6,8 @@
  * This component is designed to be independent of the occupancy management system,
  * communicating through well-defined callback interfaces.
  * 
- * @author NieRVoid
+ * Depends on the mqtt_manager component for MQTT operations.
+ * 
  * @date 2025-03-19
  */
 
@@ -14,6 +15,7 @@
 
 #include <stdbool.h>
 #include "esp_err.h"
+#include "mqtt_manager.h"  // Include mqtt_manager header
 
 #ifdef __cplusplus
 extern "C" {
@@ -68,35 +70,29 @@ typedef room_status_t (*status_request_callback_t)(void *user_ctx);
 /**
  * @brief MQTT remote control configuration
  */
-typedef struct {
-    const char *broker_uri;       /*!< MQTT broker URI */
-    const char *client_id;        /*!< MQTT client ID */
-    const char *username;         /*!< MQTT username or NULL */
-    const char *password;         /*!< MQTT password or NULL */
+ typedef struct {
     const char *topic_prefix;     /*!< Topic prefix for all pub/sub operations */
-    bool use_ssl;                 /*!< Enable SSL/TLS */
     uint32_t status_interval_sec; /*!< Status reporting interval in seconds */
     remote_command_callback_t command_callback; /*!< Command callback function */
     void *command_callback_ctx;   /*!< Command callback context */
     status_request_callback_t status_callback; /*!< Status callback function */
     void *status_callback_ctx;    /*!< Status callback context */
+    mqtt_user_property_t *user_properties; /*!< User properties for MQTT messages */
+    int user_property_count;       /*!< Number of user properties */
 } remote_control_config_t;
 
 /**
  * @brief Default remote control configuration
  */
 #define REMOTE_CONTROL_DEFAULT_CONFIG() {             \
-    .broker_uri = "mqtt://mqtt.example.com:1883",     \
-    .client_id = "esp32-room-control",                \
-    .username = NULL,                                 \
-    .password = NULL,                                 \
     .topic_prefix = "homestay/room/",                 \
-    .use_ssl = false,                                 \
     .status_interval_sec = 300,                       \
     .command_callback = NULL,                         \
     .command_callback_ctx = NULL,                     \
     .status_callback = NULL,                          \
     .status_callback_ctx = NULL,                      \
+    .user_properties = NULL,                          \
+    .user_property_count = 0,                         \
 }
 
 /**

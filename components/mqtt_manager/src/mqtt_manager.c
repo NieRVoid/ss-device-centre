@@ -5,7 +5,8 @@
  * Implementation of the MQTT manager component with topic registration
  * and message routing capabilities.
  * 
- * @author NieRVoid
+ * Updated to support MQTT v5 properties and user properties.
+ * 
  * @date 2025-03-20
  */
 
@@ -16,6 +17,7 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "mqtt_client.h"
+#include "mqtt5_client.h"
 #include "mqtt_manager.h"
 
 static const char *TAG = "mqtt-manager";
@@ -33,6 +35,8 @@ typedef struct {
     void *user_data;             // User data pointer
     bool active;                 // Whether this handler is active
     bool subscribed;             // Whether we've successfully subscribed to this topic
+    mqtt_user_property_t *user_properties; // User properties
+    int user_property_count;     // Number of user properties
 } mqtt_topic_handler_t;
 
 // MQTT manager structure
@@ -60,6 +64,7 @@ static void route_message(const char *topic, int topic_len, const char *data, in
 static bool topic_matches(const char *pattern, const char *topic, int topic_len);
 static esp_err_t expand_handler_array(void);
 static esp_err_t subscribe_handler(mqtt_topic_handler_t *handler);
+static esp_err_t set_user_properties(mqtt5_user_property_handle_t *user_property_handle, const mqtt_user_property_t *user_properties, int user_property_count);
 
 /**
  * @brief Initialize the MQTT manager
@@ -107,7 +112,7 @@ esp_err_t mqtt_manager_init(const mqtt_manager_config_t *config)
     
     ESP_LOGI(TAG, "MQTT broker: %s", config->broker_uri);
     
-    // Initialize MQTT client
+    // Initialize MQTT client with v5 properties
     const esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = config->broker_uri,
         .credentials.client_id = config->client_id,
@@ -131,6 +136,9 @@ esp_err_t mqtt_manager_init(const mqtt_manager_config_t *config)
         ESP_LOGE(TAG, "Failed to initialize MQTT client");
         return ESP_FAIL;
     }
+    
+    // Set MQTT v5 connection properties
+    esp_mqtt5_client_set_connect_property(mqtt_manager.client, &config->connection_property);
     
     // Register MQTT event handler
     esp_err_t ret = esp_mqtt_client_register_event(mqtt_manager.client, 
@@ -190,7 +198,10 @@ bool mqtt_manager_is_connected(void)
  */
 esp_err_t mqtt_manager_register_handler(const char *topic, int qos,
                                       mqtt_message_handler_t handler,
-                                      void *user_data, int *handler_id)
+                                      void *user_data,
+                                      const mqtt_user_property_t *user_properties,
+                                      int user_property_count,
+                                      int *handler_id)
 {
     if (topic == NULL || handler == NULL || qos < 0 || qos > 2) {
         return ESP_ERR_INVALID_ARG;
@@ -237,6 +248,21 @@ esp_err_t mqtt_manager_register_handler(const char *topic, int qos,
     mqtt_manager.handlers[index].user_data = user_data;
     mqtt_manager.handlers[index].active = true;
     mqtt_manager.handlers[index].subscribed = false;
+
+    // Set user properties
+    if (user_properties != NULL && user_property_count > 0) {
+        mqtt_manager.handlers[index].user_properties = malloc(user_property_count * sizeof(mqtt_user_property_t));
+        if (mqtt_manager.handlers[index].user_properties == NULL) {
+            free(mqtt_manager.handlers[index].topic);
+            xSemaphoreGive(mqtt_manager.handlers_mutex);
+            return ESP_ERR_NO_MEM;
+        }
+        memcpy(mqtt_manager.handlers[index].user_properties, user_properties, user_property_count * sizeof(mqtt_user_property_t));
+        mqtt_manager.handlers[index].user_property_count = user_property_count;
+    } else {
+        mqtt_manager.handlers[index].user_properties = NULL;
+        mqtt_manager.handlers[index].user_property_count = 0;
+    }
     
     // Return handler ID
     if (handler_id != NULL) {
@@ -280,6 +306,12 @@ esp_err_t mqtt_manager_unregister_handler(int handler_id)
             free(mqtt_manager.handlers[i].topic);
             mqtt_manager.handlers[i].topic = NULL;
             mqtt_manager.handlers[i].active = false;
+
+            // Free user properties
+            if (mqtt_manager.handlers[i].user_properties != NULL) {
+                free(mqtt_manager.handlers[i].user_properties);
+                mqtt_manager.handlers[i].user_properties = NULL;
+            }
             
             // No need to unsubscribe, as other handlers might still be interested in this topic
             // We'll clean up unused subscriptions only when disconnecting and reconnecting
@@ -299,7 +331,9 @@ esp_err_t mqtt_manager_unregister_handler(int handler_id)
  * @brief Publish a message to an MQTT topic
  */
 int mqtt_manager_publish(const char *topic, const void *data, int len, 
-                        int qos, int retain)
+                        int qos, int retain,
+                        const mqtt_user_property_t *user_properties,
+                        int user_property_count)
 {
     if (topic == NULL || (data == NULL && len > 0) || qos < 0 || qos > 2) {
         return ESP_ERR_INVALID_ARG;
@@ -322,6 +356,14 @@ int mqtt_manager_publish(const char *topic, const void *data, int len,
     
     ESP_LOGD(TAG, "Publishing to '%s' (QoS %d, retain %d): %.*s", 
              topic, qos, retain, len, (const char *)data);
+    
+    // Set MQTT v5 publish properties
+    esp_mqtt5_publish_property_config_t publish_property = {0};
+    publish_property.user_property = NULL;
+    if (user_properties != NULL && user_property_count > 0) {
+        set_user_properties(&publish_property.user_property, user_properties, user_property_count);
+    }
+    esp_mqtt5_client_set_publish_property(mqtt_manager.client, &publish_property);
     
     int msg_id = esp_mqtt_client_publish(mqtt_manager.client, topic, 
                                         data, len, qos, retain);
@@ -361,11 +403,14 @@ esp_err_t mqtt_manager_deinit(void)
     if (mqtt_manager.handlers_mutex) {
         xSemaphoreTake(mqtt_manager.handlers_mutex, portMAX_DELAY);
         
-        // Free all handler topics
+        // Free all handler topics and user properties
         if (mqtt_manager.handlers) {
             for (int i = 0; i < mqtt_manager.handler_count; i++) {
                 if (mqtt_manager.handlers[i].active && mqtt_manager.handlers[i].topic) {
                     free(mqtt_manager.handlers[i].topic);
+                }
+                if (mqtt_manager.handlers[i].user_properties) {
+                    free(mqtt_manager.handlers[i].user_properties);
                 }
             }
             free(mqtt_manager.handlers);
@@ -520,6 +565,14 @@ static esp_err_t subscribe_handler(mqtt_topic_handler_t *handler)
     ESP_LOGI(TAG, "Subscribing to topic '%s' with QoS %d", 
              handler->topic, handler->qos);
     
+    // Set MQTT v5 subscribe properties
+    esp_mqtt5_subscribe_property_config_t subscribe_property = {0};
+    subscribe_property.user_property = NULL;
+    if (handler->user_properties != NULL && handler->user_property_count > 0) {
+        set_user_properties(&subscribe_property.user_property, handler->user_properties, handler->user_property_count);
+    }
+    esp_mqtt5_client_set_subscribe_property(mqtt_manager.client, &subscribe_property);
+    
     int msg_id = esp_mqtt_client_subscribe(mqtt_manager.client, 
                                          handler->topic, handler->qos);
     
@@ -586,16 +639,16 @@ static void route_message(const char *topic, int topic_len,
 
 /**
  * @brief Check if a topic matches a subscription pattern
-* 
-* MQTT wildcards supported:
-* + (plus) matches a single level
-* # (hash) matches multiple levels (must be the last character)
-* 
-* @param pattern Subscription pattern
-* @param topic Actual topic
-* @param topic_len Topic length
-* @return bool true if match, false otherwise
-*/
+ * 
+ * MQTT wildcards supported:
+ * + (plus) matches a single level
+ * # (hash) matches multiple levels (must be the last character)
+ * 
+ * @param pattern Subscription pattern
+ * @param topic Actual topic
+ * @param topic_len Topic length
+ * @return bool true if match, false otherwise
+ */
 static bool topic_matches(const char *pattern, const char *topic, int topic_len)
 {
    // Create a null-terminated copy of the topic if it isn't already
@@ -673,10 +726,10 @@ static bool topic_matches(const char *pattern, const char *topic, int topic_len)
 }
 
 /**
-* @brief Expand the handlers array capacity
-* 
-* @return esp_err_t ESP_OK on success, error code otherwise
-*/
+ * @brief Expand the handlers array capacity
+ * 
+ * @return esp_err_t ESP_OK on success, error code otherwise
+ */
 static esp_err_t expand_handler_array(void)
 {
    int new_capacity = (int)(mqtt_manager.handler_capacity * REALLOC_MULTIPLIER);
@@ -706,4 +759,33 @@ static esp_err_t expand_handler_array(void)
    mqtt_manager.handler_capacity = new_capacity;
    
    return ESP_OK;
+}
+
+/**
+ * @brief Set user properties for MQTT v5 messages
+ * 
+ * @param user_property_handle Pointer to user property handle
+ * @param user_properties Array of user properties
+ * @param user_property_count Number of user properties
+ * @return esp_err_t ESP_OK on success, error code otherwise
+ */
+static esp_err_t set_user_properties(mqtt5_user_property_handle_t *user_property_handle, const mqtt_user_property_t *user_properties, int user_property_count)
+{
+    if (user_property_handle == NULL || user_properties == NULL || user_property_count <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_mqtt5_user_property_item_t *items = malloc(user_property_count * sizeof(esp_mqtt5_user_property_item_t));
+    if (items == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    for (int i = 0; i < user_property_count; i++) {
+        items[i].key = user_properties[i].key;
+        items[i].value = user_properties[i].value;
+    }
+
+    esp_err_t ret = esp_mqtt5_client_set_user_property(user_property_handle, items, user_property_count);
+    free(items);
+    return ret;
 }

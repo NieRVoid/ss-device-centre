@@ -13,8 +13,9 @@
  * 1. Radar-based people counting (high accuracy, continuous)
  * 2. BOOT button on GPIO0 (high reliability, triggered)
  * 3. MQTT remote control (medium reliability, triggered)
- *
- * @author NieRVoid
+ * 
+ * Updated to use mqtt_manager and remote_control components.
+ * 
  * @date 2025-03-20
  * @license MIT
  */
@@ -37,7 +38,7 @@
 #include "ld2450.h"
 #include "people_counter.h"
 #include "occupancy_manager.h"
-#include "mqtt_manager.h"       // New MQTT manager component
+#include "mqtt_manager.h"
 #include "remote_control.h"
 
 // Include secrets header
@@ -250,7 +251,7 @@ void app_main(void)
     mqtt_config.client_id = SECRET_MQTT_CLIENT_ID;
     mqtt_config.username = SECRET_MQTT_USERNAME;
     mqtt_config.password = SECRET_MQTT_PASSWORD;
-    mqtt_config.use_ssl = true;  // Enable SSL if broker requires it
+    mqtt_config.use_ssl = false;
     mqtt_config.keepalive = 120;
     mqtt_config.connect_handler = mqtt_connect_handler;
     mqtt_config.disconnect_handler = mqtt_disconnect_handler;
@@ -286,14 +287,23 @@ void app_main(void)
     ESP_LOGI(TAG, "⚙️  Initializing MQTT remote control...");
 
     remote_control_config_t remote_config = REMOTE_CONTROL_DEFAULT_CONFIG();
-    remote_config.broker_uri = SECRET_MQTT_BROKER_URI;  // Not used directly anymore, but kept for compatibility
-    remote_config.client_id = SECRET_MQTT_CLIENT_ID;    // Not used directly anymore
-    remote_config.username = SECRET_MQTT_USERNAME;      // Not used directly anymore
-    remote_config.password = SECRET_MQTT_PASSWORD;      // Not used directly anymore
     remote_config.topic_prefix = SECRET_MQTT_TOPIC_PREFIX;
     remote_config.status_interval_sec = 300; // 5 minute updates
     remote_config.command_callback = remote_command_handler;
     remote_config.status_callback = get_room_status;
+
+    // Define user properties
+    mqtt_user_property_t user_properties[] = {
+        {"room_id", SECRET_ROOM_ID},
+        {"device_id", SECRET_DEVICE_ID},
+        {"device_type", SECRET_DEVICE_TYPE},
+        {"firmware_version", FIRMWARE_VERSION}
+    };
+    int user_property_count = sizeof(user_properties) / sizeof(user_properties[0]);
+
+    // Add the user properties to the remote control configuration
+    remote_config.user_properties = user_properties;
+    remote_config.user_property_count = user_property_count;
 
     ret = remote_control_init(&remote_config);
     if (ret != ESP_OK) {
@@ -341,7 +351,7 @@ static void mqtt_connect_handler(void *user_data)
     snprintf(msg, sizeof(msg), "{\"event\":\"connected\",\"device\":\"%s\",\"timestamp\":%lld}",
              SECRET_MQTT_CLIENT_ID, (long long)(esp_timer_get_time() / 1000));
     
-    mqtt_manager_publish(SECRET_MQTT_TOPIC_PREFIX "system", msg, -1, 0, 0);
+    mqtt_manager_publish(SECRET_MQTT_TOPIC_PREFIX "system", msg, -1, 0, 0, NULL, 0);
 }
 
 /**
@@ -482,7 +492,7 @@ static const char* get_reliability_name(occupancy_reliability_t reliability)
         case OCCUPANCY_RELIABILITY_MEDIUM:   return "Medium";
         case OCCUPANCY_RELIABILITY_HIGH:     return "High";
         case OCCUPANCY_RELIABILITY_ABSOLUTE: return "Absolute";
-        default:                            return "Unknown";
+        default:                             return "Unknown";
     }
 }
 

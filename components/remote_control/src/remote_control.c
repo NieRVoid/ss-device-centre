@@ -4,7 +4,8 @@
  * 
  * Implementation of the remote control component using the mqtt_manager component
  * 
- * @author NieRVoid
+ * Updated to use the mqtt_manager component for MQTT operations.
+ * 
  * @date 2025-03-20
  */
 
@@ -49,6 +50,10 @@ typedef struct {
     
     // Configuration
     uint32_t status_interval_sec;
+
+    // User properties for MQTT messages
+    mqtt_user_property_t *user_properties;
+    int user_property_count;
 } remote_control_t;
 
 static remote_control_t remote_control = {0};
@@ -123,9 +128,7 @@ esp_err_t remote_control_init(const remote_control_config_t *config)
     ESP_LOGI(TAG, "Status topic: %s", remote_control.status_topic);
     ESP_LOGI(TAG, "Command topic: %s", remote_control.command_topic);
     
-    // Initialize MQTT manager if it's not already initialized
-    // Note: This assumes the application has already initialized mqtt_manager
-    // with the appropriate broker settings
+    // Ensure the MQTT manager is connected
     if (!mqtt_manager_is_connected()) {
         ESP_LOGW(TAG, "MQTT Manager not connected - ensure it's initialized before using remote control");
     }
@@ -168,6 +171,8 @@ esp_err_t remote_control_start(void)
         1, // QoS 1
         mqtt_message_handler,
         NULL,
+        NULL,
+        0,
         &handler_id
     );
     
@@ -314,71 +319,73 @@ static void report_timer_callback(void *arg)
 /**
  * @brief Internal function to publish room status
  */
-static esp_err_t publish_status_internal(const room_status_t *status)
-{
-    if (!mqtt_manager_is_connected() || status == NULL) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    
-    // Take mutex to ensure thread safety
-    if (xSemaphoreTake(remote_control.mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
-        ESP_LOGW(TAG, "Failed to take mutex for publishing");
-        return ESP_ERR_TIMEOUT;
-    }
-    
-    // Convert room state to string
-    const char *state_str = "unknown";
-    switch (status->state) {
-        case ROOM_STATE_VACANT:
-            state_str = "vacant";
-            break;
-        case ROOM_STATE_OCCUPIED:
-            state_str = "occupied";
-            break;
-        default:
-            state_str = "unknown";
-            break;
-    }
-    
-    // Format status as JSON
-    char json_buffer[256];
-    snprintf(json_buffer, sizeof(json_buffer), 
-             "{"
-             "\"state\":\"%s\","
-             "\"count\":%d,"
-             "\"count_reliable\":%s,"
-             "\"source\":\"%s\","
-             "\"reliability\":%d,"
-             "\"timestamp\":%lld"
-             "}",
-             state_str,
-             status->occupant_count,
-             status->count_reliable ? "true" : "false",
-             status->source_name ? status->source_name : "unknown",
-             status->source_reliability,
-             esp_timer_get_time() / 1000 // microseconds to milliseconds
-    );
-    
-    // Publish the status using MQTT manager
-    ESP_LOGI(TAG, "Publishing status: %s", json_buffer);
-    int msg_id = mqtt_manager_publish(
-        remote_control.status_topic,
-        json_buffer, 
-        -1,  // use null-terminator
-        1,   // QoS 1
-        1    // retain
-    );
-    
-    xSemaphoreGive(remote_control.mutex);
-    
-    if (msg_id < 0) {
-        ESP_LOGE(TAG, "Failed to publish status");
-        return ESP_FAIL;
-    }
-    
-    ESP_LOGI(TAG, "Status published successfully, msg_id=%d", msg_id);
-    return ESP_OK;
-}
+ static esp_err_t publish_status_internal(const room_status_t *status)
+ {
+     if (!mqtt_manager_is_connected() || status == NULL) {
+         return ESP_ERR_INVALID_STATE;
+     }
+     
+     // Take mutex to ensure thread safety
+     if (xSemaphoreTake(remote_control.mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+         ESP_LOGW(TAG, "Failed to take mutex for publishing");
+         return ESP_ERR_TIMEOUT;
+     }
+     
+     // Convert room state to string
+     const char *state_str = "unknown";
+     switch (status->state) {
+         case ROOM_STATE_VACANT:
+             state_str = "vacant";
+             break;
+         case ROOM_STATE_OCCUPIED:
+             state_str = "occupied";
+             break;
+         default:
+             state_str = "unknown";
+             break;
+     }
+     
+     // Format status as JSON
+     char json_buffer[256];
+     snprintf(json_buffer, sizeof(json_buffer), 
+              "{"
+              "\"state\":\"%s\","
+              "\"count\":%d,"
+              "\"count_reliable\":%s,"
+              "\"source\":\"%s\","
+              "\"reliability\":%d,"
+              "\"timestamp\":%lld"
+              "}",
+              state_str,
+              status->occupant_count,
+              status->count_reliable ? "true" : "false",
+              status->source_name ? status->source_name : "unknown",
+              status->source_reliability,
+              esp_timer_get_time() / 1000 // microseconds to milliseconds
+     );
+     
+     // Publish the status using MQTT manager
+     ESP_LOGI(TAG, "Publishing status: %s", json_buffer);
+     int msg_id = mqtt_manager_publish(
+         remote_control.status_topic,
+         json_buffer, 
+         -1,  // use null-terminator
+         1,   // QoS 1
+         1,   // retain
+         remote_control.user_properties,  // user properties
+         remote_control.user_property_count
+     );
+     
+     xSemaphoreGive(remote_control.mutex);
+     
+     if (msg_id < 0) {
+         ESP_LOGE(TAG, "Failed to publish status");
+         return ESP_FAIL;
+     }
+     
+     ESP_LOGI(TAG, "Status published successfully, msg_id=%d", msg_id);
+     return ESP_OK;
+ }
 
 /**
  * @brief Publish room status update
