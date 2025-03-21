@@ -4,4 +4,5 @@
 /sdkconfig.defaults
 /sdkconfig.old
 
+/dependencies.lock
 /main/secrets.h
