@@ -1,0 +1,18 @@
+idf_component_register(
+    SRCS
+        "main.c"
+    INCLUDE_DIRS
+        ""
+    REQUIRES
+        nvs_flash
+        esp_netif
+        esp_timer
+        driver
+        ld2450_driver
+        people_counter
+        mqtt_manager
+        remote_control
+        occupancy_manager
+    PRIV_REQUIRES
+        spi_flash
+)

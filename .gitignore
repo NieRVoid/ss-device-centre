@@ -1,0 +1,7 @@
+/.vscode
+/build
+/sdkconfig
+/sdkconfig.defaults
+/sdkconfig.old
+
+/main/secrets.h
