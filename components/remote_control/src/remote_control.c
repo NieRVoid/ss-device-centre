@@ -124,6 +124,21 @@ esp_err_t remote_control_init(const remote_control_config_t *config)
     snprintf(remote_control.command_topic, command_topic_len + 1, "%s%s", 
              config->topic_prefix, TOPIC_COMMAND);
     
+    // Store user properties
+    if (config->user_properties && config->user_property_count > 0) {
+        remote_control.user_properties = malloc(config->user_property_count * sizeof(mqtt_user_property_t));
+        if (!remote_control.user_properties) {
+            ret = ESP_ERR_NO_MEM;
+            goto cleanup;
+        }
+        memcpy(remote_control.user_properties, config->user_properties, 
+               config->user_property_count * sizeof(mqtt_user_property_t));
+        remote_control.user_property_count = config->user_property_count;
+    } else {
+        remote_control.user_properties = NULL;
+        remote_control.user_property_count = 0;
+    }
+
     // Log topic information
     ESP_LOGI(TAG, "Status topic: %s", remote_control.status_topic);
     ESP_LOGI(TAG, "Command topic: %s", remote_control.command_topic);
@@ -151,6 +166,7 @@ cleanup:
     if (remote_control.topic_prefix) free(remote_control.topic_prefix);
     if (remote_control.status_topic) free(remote_control.status_topic);
     if (remote_control.command_topic) free(remote_control.command_topic);
+    if (remote_control.user_properties) free(remote_control.user_properties);
     if (remote_control.mutex) vSemaphoreDelete(remote_control.mutex);
     if (remote_control.report_timer) esp_timer_delete(remote_control.report_timer);
     
@@ -171,8 +187,8 @@ esp_err_t remote_control_start(void)
         1, // QoS 1
         mqtt_message_handler,
         NULL,
-        NULL,
-        0,
+        remote_control.user_properties,
+        remote_control.user_property_count,
         &handler_id
     );
     
@@ -420,6 +436,7 @@ esp_err_t remote_control_deinit(void)
     if (remote_control.topic_prefix) free(remote_control.topic_prefix);
     if (remote_control.status_topic) free(remote_control.status_topic);
     if (remote_control.command_topic) free(remote_control.command_topic);
+    if (remote_control.user_properties) free(remote_control.user_properties);
     if (remote_control.mutex) vSemaphoreDelete(remote_control.mutex);
     if (remote_control.report_timer) esp_timer_delete(remote_control.report_timer);
     

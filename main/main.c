@@ -280,7 +280,20 @@ void app_main(void)
             ESP_LOGI(TAG, "✅ MQTT manager started successfully");
         }
     }
-    
+
+    // Wait for MQTT Manager to connect
+    int wait_time_ms = 0;
+    while (!mqtt_manager_is_connected() && wait_time_ms < 10000) { // Wait up to 10 seconds
+        ESP_LOGI(TAG, "Waiting for MQTT Manager to connect...");
+        vTaskDelay(pdMS_TO_TICKS(100)); // Wait 100ms
+        wait_time_ms += 100;
+    }
+
+    if (!mqtt_manager_is_connected()) {
+        ESP_LOGE(TAG, "MQTT Manager failed to connect within the timeout period");
+        return;
+    }
+
     // ------------------------------------------------------------------------
     // 7. Initialize MQTT remote control
     // ------------------------------------------------------------------------
@@ -294,10 +307,10 @@ void app_main(void)
 
     // Define user properties
     mqtt_user_property_t user_properties[] = {
-        {"room_id", SECRET_ROOM_ID},
-        {"device_id", SECRET_DEVICE_ID},
-        {"device_type", SECRET_DEVICE_TYPE},
-        {"firmware_version", FIRMWARE_VERSION}
+        {"deviceType", SECRET_DEVICE_TYPE},
+        {"roomId", SECRET_ROOM_ID},
+        {"deviceId", SECRET_DEVICE_ID},
+        {"firmwareVersion", FIRMWARE_VERSION}
     };
     int user_property_count = sizeof(user_properties) / sizeof(user_properties[0]);
 
