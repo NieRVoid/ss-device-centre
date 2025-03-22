@@ -524,22 +524,34 @@ static void determine_led_color(int source_id, int count, int *r, int *g, int *b
     *r = 255;
     *g = 220;
     *b = 180;
-    
-    // Adjust based on source
+
+    // Limit count for color gradient (max 5)
+    int adjusted_count = (count > 5) ? 5 : (count < 0) ? 0 : count;
+
     if (source_id == SOURCE_RADAR) {
-        // Radar: blue-green gradient based on count (1-3)
+        // Radar: blue color scheme
         *r = 0;
-        *g = 150 + (count > 0 ? (count <= 3 ? count * 35 : 105) : 0);
-        *b = 200 + (count > 0 ? (count <= 3 ? count * 18 : 55) : 0);
+        *g = 0;
+        if (adjusted_count == 0) {
+            *b = 0; // No people
+        } else {
+            // Linear gradient: count 1-5 maps from 100 to 255
+            *b = 100 + ((adjusted_count - 1) * (155 / 4)); // Values: 100,138,177,216,255
+        }
     } 
     else if (source_id == SOURCE_REMOTE) {
-        // Remote: purple gradient based on count (1-3)
-        *r = 180 + (count > 0 ? (count <= 3 ? count * 25 : 75) : 0);
-        *g = 0;
-        *b = 220 + (count > 0 ? (count <= 3 ? count * 11 : 35) : 0);
-    } 
+        // Remote: green color scheme
+        *r = 0;
+        *b = 0;
+        if (adjusted_count == 0) {
+            *g = 0; // No people
+        } else {
+            // Linear gradient: count 1-5 maps from 100 to 255
+            *g = 100 + ((adjusted_count - 1) * (155 / 4)); // Values: 100,138,177,216,255
+        }
+    }
     else if (source_id == SOURCE_BUTTON) {
-        // Button: fixed amber color
+        // Button: fixed yellow color (single state as it can only detect presence)
         *r = 255;
         *g = 170;
         *b = 0;
