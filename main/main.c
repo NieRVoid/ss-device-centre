@@ -65,6 +65,10 @@ static const char* get_reliability_name(occupancy_reliability_t reliability);
 static const char* get_source_name(occupancy_source_id_t source_id);
 static void print_radar_targets(const ld2450_frame_t *frame);
 
+// New function prototypes for LED control
+static void send_led_control_message(bool power_on, int red, int green, int blue);
+static void determine_led_color(occupancy_source_id_t source, int count, int *r, int *g, int *b);
+
 // Remote control function prototypes
 static void remote_command_handler(remote_command_t command, const char *payload, void *user_ctx);
 static room_status_t get_room_status(void *user_ctx);
@@ -510,6 +514,85 @@ static const char* get_reliability_name(occupancy_reliability_t reliability)
 }
 
 /**
+ * @brief Determine RGB LED color based on occupancy source and count
+ * 
+ * @param source The occupancy source ID
+ * @param count The number of people detected
+ * @param r Pointer to store red component (0-255)
+ * @param g Pointer to store green component (0-255)
+ * @param b Pointer to store blue component (0-255)
+ */
+static void determine_led_color(occupancy_source_id_t source, int count, int *r, int *g, int *b)
+{
+    // Default color (warm white)
+    *r = 255;
+    *g = 220;
+    *b = 180;
+    
+    // Adjust based on source
+    if (source == radar_source_id) {
+        // Radar: blue-green gradient based on count (1-3)
+        *r = 0;
+        *g = 150 + (count > 0 ? (count <= 3 ? count * 35 : 105) : 0);
+        *b = 200 + (count > 0 ? (count <= 3 ? count * 18 : 55) : 0);
+    } 
+    else if (source == remote_source_id) {
+        // Remote: purple gradient based on count (1-3)
+        *r = 180 + (count > 0 ? (count <= 3 ? count * 25 : 75) : 0);
+        *g = 0;
+        *b = 220 + (count > 0 ? (count <= 3 ? count * 11 : 35) : 0);
+    } 
+    else if (source == button_source_id) {
+        // Button: fixed amber color
+        *r = 255;
+        *g = 170;
+        *b = 0;
+    }
+    
+    // Ensure values are in valid range
+    *r = (*r > 255) ? 255 : (*r < 0 ? 0 : *r);
+    *g = (*g > 255) ? 255 : (*g < 0 ? 0 : *g);
+    *b = (*b > 255) ? 255 : (*b < 0 ? 0 : *b);
+}
+
+/**
+ * @brief Send LED control message via MQTT
+ * 
+ * @param power_on True to turn LED on, false to turn it off
+ * @param red Red component (0-255)
+ * @param green Green component (0-255)
+ * @param blue Blue component (0-255)
+ */
+static void send_led_control_message(bool power_on, int red, int green, int blue)
+{
+    // Skip if MQTT manager is not connected
+    if (!mqtt_manager_is_connected()) {
+        ESP_LOGW(TAG, "Cannot send LED control - MQTT not connected");
+        return;
+    }
+
+    // Create message payload
+    char payload[128];
+    snprintf(payload, sizeof(payload), 
+             "{\"power\":\"%s\",\"color\":{\"r\":%d,\"g\":%d,\"b\":%d}}",
+             power_on ? "on" : "off", red, green, blue);
+    
+    // Topic to control the LED device
+    char topic[128];
+    strcpy(topic, SECRET_MQTT_TOPIC_CONTROL);
+    
+    ESP_LOGI(TAG, "🌈 Sending LED control message: %s", payload);
+    
+    // Publish the message with QoS 1 to ensure delivery
+    int msg_id = mqtt_manager_publish(topic, payload, -1, 1, 0, NULL, 0);
+    if (msg_id < 0) {
+        ESP_LOGE(TAG, "❌ Failed to publish LED control message: %d", msg_id);
+    } else {
+        ESP_LOGI(TAG, "✅ LED control message sent successfully (msg_id=%d)", msg_id);
+    }
+}
+
+/**
  * @brief Callback for occupancy status changes
  */
 static void occupancy_status_callback(const occupancy_status_t *status, void *user_ctx)
@@ -527,6 +610,22 @@ static void occupancy_status_callback(const occupancy_status_t *status, void *us
     };
     
     remote_control_publish_status(&room_status);
+    
+    // Control RGB LED based on occupancy
+    int r = 0, g = 0, b = 0;
+    
+    if (status->is_occupied) {
+        // Room is occupied - set LED color based on source and count
+        determine_led_color(status->source, status->count, &r, &g, &b);
+        send_led_control_message(true, r, g, b);
+        
+        ESP_LOGI(TAG, "💡 LED turned ON (R:%d, G:%d, B:%d) based on %s source", 
+                r, g, b, get_source_name(status->source));
+    } else {
+        // Room is vacant - turn LED off
+        send_led_control_message(false, 0, 0, 0);
+        ESP_LOGI(TAG, "💡 LED turned OFF - room is vacant");
+    }
 }
 
 /**
