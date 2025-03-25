@@ -188,6 +188,16 @@ bool mqtt_manager_is_connected(void);
  */
 esp_err_t mqtt_manager_deinit(void);
 
+/**
+ * @brief Get the current memory usage of the MQTT manager
+ * 
+ * @param handlers_memory Pointer to store handlers memory usage (bytes)
+ * @param topics_memory Pointer to store topics memory usage (bytes)
+ * @param properties_memory Pointer to store properties memory usage (bytes)
+ * @return Total memory usage in bytes
+ */
+size_t mqtt_manager_get_memory_usage(size_t *handlers_memory, size_t *topics_memory, size_t *properties_memory);
+
 #ifdef __cplusplus
 }
 #endif

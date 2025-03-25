@@ -26,6 +26,50 @@ static const char *TAG = "mqtt-manager";
 #define INITIAL_HANDLER_CAPACITY 8
 #define REALLOC_MULTIPLIER 1.5
 
+// Add memory tracking variables
+static size_t s_total_handlers_memory = 0;
+static size_t s_total_topics_memory = 0;
+static size_t s_total_properties_memory = 0;
+
+// Define topic optimization threshold
+#define SMALL_TOPIC_MAX_LEN 32
+
+// Add a static buffer pool for small topics
+typedef struct {
+    char data[SMALL_TOPIC_MAX_LEN + 1];
+    bool used;
+} small_topic_buffer_t;
+
+#define SMALL_TOPIC_POOL_SIZE 8
+static small_topic_buffer_t s_small_topic_pool[SMALL_TOPIC_POOL_SIZE] = {0};
+
+// Function to get small topic buffer
+static char* get_small_topic_buffer(const char* topic) {
+    size_t len = strlen(topic);
+    if (len > SMALL_TOPIC_MAX_LEN) {
+        return NULL;
+    }
+    
+    for (int i = 0; i < SMALL_TOPIC_POOL_SIZE; i++) {
+        if (!s_small_topic_pool[i].used) {
+            s_small_topic_pool[i].used = true;
+            strcpy(s_small_topic_pool[i].data, topic);
+            return s_small_topic_pool[i].data;
+        }
+    }
+    return NULL; // No buffer available
+}
+
+// Function to release small topic buffer
+static void release_small_topic_buffer(char* buffer) {
+    for (int i = 0; i < SMALL_TOPIC_POOL_SIZE; i++) {
+        if (s_small_topic_pool[i].data == buffer) {
+            s_small_topic_pool[i].used = false;
+            return;
+        }
+    }
+}
+
 // Topic handler structure
 typedef struct {
     int id;                      // Unique handler ID
@@ -154,6 +198,14 @@ esp_err_t mqtt_manager_init(const mqtt_manager_config_t *config)
         return ret;
     }
     
+    // Reset memory tracking
+    s_total_handlers_memory = INITIAL_HANDLER_CAPACITY * sizeof(mqtt_topic_handler_t);
+    s_total_topics_memory = 0;
+    s_total_properties_memory = 0;
+    
+    // Clear small topic pool
+    memset(s_small_topic_pool, 0, sizeof(s_small_topic_pool));
+    
     return ESP_OK;
 }
 
@@ -234,11 +286,18 @@ esp_err_t mqtt_manager_register_handler(const char *topic, int qos,
         index = mqtt_manager.handler_count++;
     }
     
-    // Allocate topic string
-    mqtt_manager.handlers[index].topic = strdup(topic);
+    // First try to use a small topic buffer for common topics
+    mqtt_manager.handlers[index].topic = get_small_topic_buffer(topic);
+    
+    // If small buffer not available, fall back to dynamic allocation
     if (mqtt_manager.handlers[index].topic == NULL) {
-        xSemaphoreGive(mqtt_manager.handlers_mutex);
-        return ESP_ERR_NO_MEM;
+        mqtt_manager.handlers[index].topic = strdup(topic);
+        if (mqtt_manager.handlers[index].topic == NULL) {
+            xSemaphoreGive(mqtt_manager.handlers_mutex);
+            return ESP_ERR_NO_MEM;
+        }
+        // Track topic memory
+        s_total_topics_memory += strlen(topic) + 1;
     }
     
     // Initialize handler
@@ -249,16 +308,25 @@ esp_err_t mqtt_manager_register_handler(const char *topic, int qos,
     mqtt_manager.handlers[index].active = true;
     mqtt_manager.handlers[index].subscribed = false;
 
-    // Set user properties
+    // Optimize user property allocation
     if (user_properties != NULL && user_property_count > 0) {
-        mqtt_manager.handlers[index].user_properties = malloc(user_property_count * sizeof(mqtt_user_property_t));
+        size_t props_size = user_property_count * sizeof(mqtt_user_property_t);
+        mqtt_manager.handlers[index].user_properties = malloc(props_size);
         if (mqtt_manager.handlers[index].user_properties == NULL) {
-            free(mqtt_manager.handlers[index].topic);
+            if (get_small_topic_buffer(topic) == NULL) {
+                free(mqtt_manager.handlers[index].topic);
+                s_total_topics_memory -= strlen(topic) + 1;
+            } else {
+                release_small_topic_buffer(mqtt_manager.handlers[index].topic);
+            }
             xSemaphoreGive(mqtt_manager.handlers_mutex);
             return ESP_ERR_NO_MEM;
         }
-        memcpy(mqtt_manager.handlers[index].user_properties, user_properties, user_property_count * sizeof(mqtt_user_property_t));
+        memcpy(mqtt_manager.handlers[index].user_properties, user_properties, props_size);
         mqtt_manager.handlers[index].user_property_count = user_property_count;
+        
+        // Track properties memory
+        s_total_properties_memory += props_size;
     } else {
         mqtt_manager.handlers[index].user_properties = NULL;
         mqtt_manager.handlers[index].user_property_count = 0;
@@ -302,13 +370,27 @@ esp_err_t mqtt_manager_unregister_handler(int handler_id)
             ESP_LOGI(TAG, "Unregistering handler %d for topic '%s'", 
                      handler_id, mqtt_manager.handlers[i].topic);
             
-            // Free topic string
-            free(mqtt_manager.handlers[i].topic);
+            // Check if using small topic buffer
+            bool is_small_buffer = false;
+            for (int j = 0; j < SMALL_TOPIC_POOL_SIZE; j++) {
+                if (s_small_topic_pool[j].data == mqtt_manager.handlers[i].topic) {
+                    is_small_buffer = true;
+                    release_small_topic_buffer(mqtt_manager.handlers[i].topic);
+                    break;
+                }
+            }
+            
+            // Free topic string if dynamically allocated
+            if (!is_small_buffer) {
+                s_total_topics_memory -= strlen(mqtt_manager.handlers[i].topic) + 1;
+                free(mqtt_manager.handlers[i].topic);
+            }
             mqtt_manager.handlers[i].topic = NULL;
             mqtt_manager.handlers[i].active = false;
 
             // Free user properties
             if (mqtt_manager.handlers[i].user_properties != NULL) {
+                s_total_properties_memory -= mqtt_manager.handlers[i].user_property_count * sizeof(mqtt_user_property_t);
                 free(mqtt_manager.handlers[i].user_properties);
                 mqtt_manager.handlers[i].user_properties = NULL;
             }
@@ -436,6 +518,14 @@ esp_err_t mqtt_manager_deinit(void)
     mqtt_manager.connect_handler_ctx = NULL;
     mqtt_manager.disconnect_handler = NULL;
     mqtt_manager.disconnect_handler_ctx = NULL;
+    
+    // Reset memory tracking
+    s_total_handlers_memory = 0;
+    s_total_topics_memory = 0;
+    s_total_properties_memory = 0;
+    
+    // Clear small topic pool
+    memset(s_small_topic_pool, 0, sizeof(s_small_topic_pool));
     
     return ESP_OK;
 }
@@ -598,12 +688,23 @@ static void route_message(const char *topic, int topic_len,
         return;
     }
     
-    // Create a null-terminated copy of the topic for matching
-    char *topic_str = malloc(topic_len + 1);
-    if (topic_str == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate memory for topic copy");
-        xSemaphoreGive(mqtt_manager.handlers_mutex);
-        return;
+    // Use stack allocation for topic instead of heap
+    char topic_buf[128]; // Use a reasonably sized stack buffer
+    char *topic_str;
+    bool heap_allocated = false;
+    
+    if (topic_len < sizeof(topic_buf)) {
+        // Use stack buffer if topic fits
+        topic_str = topic_buf;
+    } else {
+        // Fall back to heap for very long topics
+        topic_str = malloc(topic_len + 1);
+        if (topic_str == NULL) {
+            ESP_LOGE(TAG, "Failed to allocate memory for topic copy");
+            xSemaphoreGive(mqtt_manager.handlers_mutex);
+            return;
+        }
+        heap_allocated = true;
     }
     
     memcpy(topic_str, topic, topic_len);
@@ -627,13 +728,19 @@ static void route_message(const char *topic, int topic_len,
             // Reacquire mutex
             if (xSemaphoreTake(mqtt_manager.handlers_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
                 ESP_LOGE(TAG, "Failed to retake handlers mutex after callback");
-                free(topic_str);
+                if (heap_allocated) {
+                    free(topic_str);
+                }
                 return;
             }
         }
     }
     
-    free(topic_str);
+    // Clean up if heap allocated
+    if (heap_allocated) {
+        free(topic_str);
+    }
+    
     xSemaphoreGive(mqtt_manager.handlers_mutex);
 }
 
@@ -651,78 +758,73 @@ static void route_message(const char *topic, int topic_len,
  */
 static bool topic_matches(const char *pattern, const char *topic, int topic_len)
 {
-   // Create a null-terminated copy of the topic if it isn't already
-   bool allocated = false;
-   char *topic_str = (char *)topic;
-   
-   if (topic[topic_len] != '\0') {
-       topic_str = malloc(topic_len + 1);
-       if (topic_str == NULL) {
-           ESP_LOGE(TAG, "Failed to allocate memory for topic in matching");
-           return false;
-       }
-       memcpy(topic_str, topic, topic_len);
-       topic_str[topic_len] = '\0';
-       allocated = true;
-   }
-   
-   // Algorithm to match MQTT topics with wildcards
-   const char *p = pattern;
-   const char *t = topic_str;
-   const char *p_end = pattern + strlen(pattern);
-   const char *t_end = topic_str + strlen(topic_str);
-   
-   while (p < p_end && t < t_end) {
-       if (*p == '+') {
-           // '+' matches exactly one level, so find the next '/'
-           p++;
-           // Skip to the next level in the topic
-           while (t < t_end && *t != '/') {
-               t++;
-           }
-       } else if (*p == '#') {
-           // '#' must be the last character and matches all remaining levels
-           if (p + 1 == p_end) {
-               // Match successful
-               if (allocated) {
-                   free(topic_str);
-               }
-               return true;
-           } else {
-               // Invalid pattern - # must be the last character
-               ESP_LOGW(TAG, "Invalid MQTT pattern: # must be the last character");
-               if (allocated) {
-                   free(topic_str);
-               }
-               return false;
-           }
-       } else if (*p == *t) {
-           // Exact character match
-           p++;
-           t++;
-       } else {
-           // No match
-           if (allocated) {
-               free(topic_str);
-           }
-           return false;
-       }
-       
-       // Handle level transitions (both pattern and topic at '/')
-       if (p < p_end && t < t_end && *p == '/' && *t == '/') {
-           p++;
-           t++;
-       }
-   }
-   
-   // Match if we've consumed both strings completely
-   bool match = (p == p_end && t == t_end);
-   
-   if (allocated) {
-       free(topic_str);
-   }
-   
-   return match;
+    // If topic is already null-terminated, use it directly
+    if (topic[topic_len] == '\0') {
+        // Direct matching algorithm without allocation
+        // ...implement direct matching logic...
+        
+        // This is the matching algorithm from the original function
+        const char *p = pattern;
+        const char *t = topic;
+        const char *p_end = pattern + strlen(pattern);
+        const char *t_end = topic + topic_len;
+        
+        while (p < p_end && t < t_end) {
+            if (*p == '+') {
+                p++;
+                while (t < t_end && *t != '/') {
+                    t++;
+                }
+            } else if (*p == '#') {
+                if (p + 1 == p_end) {
+                    return true;
+                } else {
+                    ESP_LOGW(TAG, "Invalid MQTT pattern: # must be the last character");
+                    return false;
+                }
+            } else if (*p == *t) {
+                p++;
+                t++;
+            } else {
+                return false;
+            }
+            
+            if (p < p_end && t < t_end && *p == '/' && *t == '/') {
+                p++;
+                t++;
+            }
+        }
+        
+        return (p == p_end && t == t_end);
+    } else {
+        // Use stack allocation for small topics
+        char stack_topic[128];
+        char *topic_str;
+        bool heap_allocated = false;
+        
+        if (topic_len < sizeof(stack_topic)) {
+            topic_str = stack_topic;
+        } else {
+            topic_str = malloc(topic_len + 1);
+            if (topic_str == NULL) {
+                ESP_LOGE(TAG, "Failed to allocate memory for topic in matching");
+                return false;
+            }
+            heap_allocated = true;
+        }
+        
+        memcpy(topic_str, topic, topic_len);
+        topic_str[topic_len] = '\0';
+        
+        // Use the same matching algorithm as above
+        bool result = topic_matches(pattern, topic_str, topic_len);
+        
+        if (heap_allocated) {
+            free(topic_str);
+        }
+        
+        return result;
+    }
 }
 
 /**
@@ -740,15 +842,21 @@ static esp_err_t expand_handler_array(void)
    ESP_LOGI(TAG, "Expanding handlers capacity from %d to %d", 
             mqtt_manager.handler_capacity, new_capacity);
    
+   size_t old_size = mqtt_manager.handler_capacity * sizeof(mqtt_topic_handler_t);
+   size_t new_size = new_capacity * sizeof(mqtt_topic_handler_t);
+   
    mqtt_topic_handler_t *new_handlers = realloc(
        mqtt_manager.handlers, 
-       new_capacity * sizeof(mqtt_topic_handler_t)
+       new_size
    );
    
    if (new_handlers == NULL) {
        ESP_LOGE(TAG, "Failed to expand handlers array");
        return ESP_ERR_NO_MEM;
    }
+   
+   // Track handlers memory
+   s_total_handlers_memory += (new_size - old_size);
    
    // Initialize new slots
    for (int i = mqtt_manager.handler_capacity; i < new_capacity; i++) {
@@ -788,4 +896,29 @@ static esp_err_t set_user_properties(mqtt5_user_property_handle_t *user_property
     esp_err_t ret = esp_mqtt5_client_set_user_property(user_property_handle, items, user_property_count);
     free(items);
     return ret;
+}
+
+/**
+ * @brief Get memory usage of the MQTT manager
+ * 
+ * @param handlers_memory Pointer to store handlers memory usage
+ * @param topics_memory Pointer to store topics memory usage
+ * @param properties_memory Pointer to store properties memory usage
+ * @return size_t Total memory usage
+ */
+size_t mqtt_manager_get_memory_usage(size_t *handlers_memory, size_t *topics_memory, size_t *properties_memory)
+{
+    if (handlers_memory) {
+        *handlers_memory = s_total_handlers_memory;
+    }
+    
+    if (topics_memory) {
+        *topics_memory = s_total_topics_memory;
+    }
+    
+    if (properties_memory) {
+        *properties_memory = s_total_properties_memory;
+    }
+    
+    return s_total_handlers_memory + s_total_topics_memory + s_total_properties_memory;
 }

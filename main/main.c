@@ -72,7 +72,6 @@ static void button_task(void *arg);
 static void people_counter_callback(int count, int entries, int exits, void *context);
 static void radar_target_callback(const ld2450_frame_t *frame, void *user_ctx);
 static void button_isr_handler(void *arg);
-static void print_radar_targets(const ld2450_frame_t *frame);
 static const char* get_reliability_name(int reliability);
 
 // Source management functions
@@ -184,6 +183,10 @@ void app_main(void)
     radar_config.uart_tx_pin = 17;
     radar_config.uart_baud_rate = 256000;
     // radar_config.auto_processing = true;
+
+    // Configure the component for verbose logging
+    radar_config.log_level = LD2450_LOG_VERBOSE;  // Enable all component logs
+    radar_config.data_log_interval_ms = 3000;     // Set to 3 seconds to match original display interval
     
     ESP_LOGI(TAG, "⚙️  Initializing LD2450 radar driver...");
     ret = ld2450_init(&radar_config);
@@ -413,37 +416,12 @@ static void button_isr_handler(void *arg)
 }
 
 /**
- * @brief Print radar targets in a human-friendly format
- */
-static void print_radar_targets(const ld2450_frame_t *frame)
-{
-    if (frame->count == 0) {
-        return;
-    }
-    
-    ESP_LOGI(TAG, "┌─────────────────────────────────────────────┐");
-    ESP_LOGI(TAG, "│             RADAR TARGET DATA               │");
-    ESP_LOGI(TAG, "├─────────┬──────────┬──────────┬─────────────┤");
-    ESP_LOGI(TAG, "│ Target  │   X (mm) │   Y (mm) │ Speed (cm/s)│");
-    ESP_LOGI(TAG, "├─────────┼──────────┼──────────┼─────────────┤");
-    
-    for (int i = 0; i < frame->count; i++) {
-        ESP_LOGI(TAG, "│ %7d │ %8d │ %8d │ %11d │", 
-            i + 1, frame->targets[i].x, frame->targets[i].y, frame->targets[i].speed);
-    }
-    
-    ESP_LOGI(TAG, "└─────────┴──────────┴──────────┴─────────────┘");
-}
-
-/**
  * @brief Callback for radar target data
  */
 static void radar_target_callback(const ld2450_frame_t *frame, void *user_ctx)
 {
-    // Only log when we have targets
-    if (frame->count > 0) {
-        print_radar_targets(frame);
-    }
+    // Empty callback - detailed logging now handled by LD2450 driver
+    // We're keeping the function as it's still used in the ld2450_register_target_callback call
 }
 
 /**
