@@ -141,6 +141,13 @@ esp_err_t remote_control_request_update(void);
  */
 esp_err_t remote_control_deinit(void);
 
+/**
+ * @brief Get memory usage of the remote control component
+ * 
+ * @return size_t Total memory usage in bytes
+ */
+size_t remote_control_get_memory_usage(void);
+
 #ifdef __cplusplus
 }
 #endif

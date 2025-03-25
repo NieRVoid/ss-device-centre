@@ -246,6 +246,14 @@ bool mqtt_manager_is_connected(void)
 }
 
 /**
+ * @brief Check if MQTT manager is initialized
+ */
+bool mqtt_manager_is_initialized(void)
+{
+    return mqtt_manager.client != NULL;
+}
+
+/**
  * @brief Register a message handler for a specific topic
  */
 esp_err_t mqtt_manager_register_handler(const char *topic, int qos,
