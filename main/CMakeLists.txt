@@ -12,7 +12,6 @@ idf_component_register(
         people_counter
         mqtt_manager
         remote_control
-        occupancy_manager
     PRIV_REQUIRES
         spi_flash
 )
