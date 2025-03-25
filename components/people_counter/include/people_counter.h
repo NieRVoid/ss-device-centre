@@ -29,9 +29,9 @@ typedef struct {
     int16_t vector_threshold;       // X-axis movement required to count entry/exit (mm)
     uint8_t empty_target_threshold; // Number of empty reports before target is considered gone
     
-    // Detection area configuration
-    int16_t detection_min_x;        // Detection area boundaries (mm)
-    int16_t detection_max_x;
+    // Detection area configuration - used only for internal filtering
+    int16_t detection_min_x;        // Detection area boundaries (mm) - internal filtering only
+    int16_t detection_max_x;        // Not used to configure radar hardware
     int16_t detection_min_y;
     int16_t detection_max_y;
     
@@ -84,7 +84,8 @@ esp_err_t people_counter_update_config(const people_counter_config_t *config);
 /**
  * @brief Configure detection region for radar
  * 
- * @note This function updates the radar's region filtering settings
+ * @note This function only affects the internal filtering of targets and
+ *       does not configure the LD2450 radar hardware region filtering
  * 
  * @return esp_err_t ESP_OK on success, error code otherwise
  */

@@ -89,21 +89,23 @@ esp_err_t people_counter_init(const people_counter_config_t *config)
         return ret;
     }
 
-    // Configure detection regions for the radar
-    ret = people_counter_configure_region();
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to configure detection region: %s", esp_err_to_name(ret));
-        // Continue anyway as this is not critical
-    }
+    // No longer configure detection regions for the radar
+    // Let radar report all targets and filter internally
 
     s_pc_context.initialized = true;
     ESP_LOGI(TAG, "People counter initialized with vector threshold: %d mm", config->vector_threshold);
+    ESP_LOGI(TAG, "Using internal detection area: X(%d,%d) Y(%d,%d) mm", 
+             config->detection_min_x, config->detection_max_x,
+             config->detection_min_y, config->detection_max_y);
 
     return ESP_OK;
 }
 
 /**
  * @brief Configure detection region for radar
+ * 
+ * Note: This function now only logs the current detection area
+ * without configuring the radar hardware.
  */
 esp_err_t people_counter_configure_region(void)
 {
@@ -111,19 +113,12 @@ esp_err_t people_counter_configure_region(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Configure detection regions for the radar
-    ld2450_region_t regions[3] = {
-        {
-            .x1 = s_pc_context.config.detection_min_x,
-            .y1 = s_pc_context.config.detection_min_y,
-            .x2 = s_pc_context.config.detection_max_x,
-            .y2 = s_pc_context.config.detection_max_y
-        },
-        {0, 0, 0, 0}, // Not used
-        {0, 0, 0, 0}  // Not used
-    };
+    // Just log the current detection area configuration
+    ESP_LOGI(TAG, "Internal detection area: X(%d,%d) Y(%d,%d) mm",
+             s_pc_context.config.detection_min_x, s_pc_context.config.detection_max_x,
+             s_pc_context.config.detection_min_y, s_pc_context.config.detection_max_y);
 
-    return ld2450_set_region_filter(LD2450_FILTER_INCLUDE_ONLY, regions);
+    return ESP_OK;
 }
 
 /**
@@ -183,14 +178,12 @@ esp_err_t people_counter_update_config(const people_counter_config_t *config)
 
     xSemaphoreGive(s_pc_context.mutex);
 
-    // Update region filter if detection area changed
-    esp_err_t ret = people_counter_configure_region();
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to update region filter: %s", esp_err_to_name(ret));
-        // Continue anyway as this is not critical
-    }
-
+    // Log updated detection area but don't configure radar
     ESP_LOGI(TAG, "Configuration updated with vector threshold: %d mm", config->vector_threshold);
+    ESP_LOGI(TAG, "Updated internal detection area: X(%d,%d) Y(%d,%d) mm",
+             config->detection_min_x, config->detection_max_x,
+             config->detection_min_y, config->detection_max_y);
+
     return ESP_OK;
 }
 
