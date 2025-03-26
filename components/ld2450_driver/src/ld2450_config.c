@@ -33,31 +33,57 @@ static const char *TAG = LD2450_LOG_TAG;
 static size_t build_command_packet(ld2450_state_t *instance, ld2450_cmd_t cmd, 
                                   const void *value, size_t value_len)
 {
-    size_t idx = 0;
+    uint8_t *buffer = instance->cmd_buffer;
     
-    // Add header
-    memcpy(&instance->cmd_buffer[idx], LD2450_CONFIG_FRAME_HEADER, 4);
-    idx += 4;
+    // Use direct 32-bit writes for header when possible
+    *(uint32_t*)buffer = *(uint32_t*)LD2450_CONFIG_FRAME_HEADER;
     
     // Add data length (command word (2 bytes) + value length)
-    instance->cmd_buffer[idx++] = (value_len + 2) & 0xFF;
-    instance->cmd_buffer[idx++] = ((value_len + 2) >> 8) & 0xFF;
+    buffer[4] = (value_len + 2) & 0xFF;
+    buffer[5] = ((value_len + 2) >> 8) & 0xFF;
     
     // Add command word (little-endian)
-    instance->cmd_buffer[idx++] = cmd & 0xFF;
-    instance->cmd_buffer[idx++] = (cmd >> 8) & 0xFF;
+    buffer[6] = cmd & 0xFF;
+    buffer[7] = (cmd >> 8) & 0xFF;
     
     // Add command value if present
     if (value != NULL && value_len > 0) {
-        memcpy(&instance->cmd_buffer[idx], value, value_len);
-        idx += value_len;
+        memcpy(&buffer[8], value, value_len);
     }
     
     // Add footer
-    memcpy(&instance->cmd_buffer[idx], LD2450_CONFIG_FRAME_FOOTER, 4);
-    idx += 4;
+    *(uint32_t*)&buffer[8 + value_len] = *(uint32_t*)LD2450_CONFIG_FRAME_FOOTER;
     
-    return idx;
+    return 8 + value_len + 4;
+}
+
+/**
+ * @brief Get the last error data buffer for debugging
+ */
+esp_err_t ld2450_get_last_error_data(uint8_t *buffer, size_t buffer_size, size_t *length) {
+    ld2450_state_t *instance = ld2450_get_instance();
+    
+    if (!instance || !instance->initialized || !buffer || !length) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    if (xSemaphoreTake(instance->mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    
+    size_t copy_len = instance->error_buffer_len;
+    if (copy_len > buffer_size) {
+        copy_len = buffer_size;
+    }
+    
+    if (copy_len > 0) {
+        memcpy(buffer, instance->error_buffer, copy_len);
+    }
+    
+    *length = copy_len;
+    
+    xSemaphoreGive(instance->mutex);
+    return ESP_OK;
 }
 
 /**
@@ -92,6 +118,12 @@ esp_err_t ld2450_send_command(ld2450_cmd_t cmd, const void *value, size_t value_
     // Clear UART RX buffer before sending command
     uart_flush(instance->uart_port);
     
+    // Clear UART event queue to ensure no old events interfere
+    uart_event_t event;
+    while (xQueueReceive(instance->uart_queue, &event, 0) == pdTRUE) {
+        // Just drain the queue
+    }
+    
     // Send the command
     int bytes_sent = uart_write_bytes(instance->uart_port, (const char *)instance->cmd_buffer, cmd_len);
     if (bytes_sent != cmd_len) {
@@ -104,31 +136,63 @@ esp_err_t ld2450_send_command(ld2450_cmd_t cmd, const void *value, size_t value_
     ESP_LOG_BUFFER_HEX_LEVEL(TAG, instance->cmd_buffer, cmd_len, ESP_LOG_VERBOSE);
     
     // Wait for ACK response
-    uint8_t byte_buf;
-    int idx = 0;
     bool found_header = false;
     bool found_footer = false;
+    bool found_cmd_echo = false;
+    int idx = 0;
+    
+    // Use a queue-based approach to check for events
     TickType_t start_time = xTaskGetTickCount();
     TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
     
     while ((xTaskGetTickCount() - start_time) < timeout_ticks && idx < LD2450_ACK_BUFFER_SIZE) {
-        int bytes_read = uart_read_bytes(instance->uart_port, &byte_buf, 1, 10 / portTICK_PERIOD_MS);
-        if (bytes_read == 1) {
-            instance->ack_buffer[idx] = byte_buf;
-            idx++;
-            
-            // Check for header
-            if (idx >= 4 && !found_header) {
-                if (memcmp(instance->ack_buffer, LD2450_CONFIG_FRAME_HEADER, 4) == 0) {
-                    found_header = true;
-                }
-            }
-            
-            // Check for footer once we have a header
-            if (found_header && idx >= 8) {  // Header + min data size + footer
-                if (memcmp(&instance->ack_buffer[idx - 4], LD2450_CONFIG_FRAME_FOOTER, 4) == 0) {
-                    found_footer = true;
-                    break;
+        // Wait for UART event with timeout
+        if (xQueueReceive(instance->uart_queue, &event, pdMS_TO_TICKS(10)) == pdTRUE) {
+            if (event.type == UART_DATA) {
+                // Read available data
+                int bytes_to_read = MIN(event.size, LD2450_ACK_BUFFER_SIZE - idx);
+                int bytes_read = uart_read_bytes(instance->uart_port, 
+                                                &instance->ack_buffer[idx], 
+                                                bytes_to_read, 
+                                                pdMS_TO_TICKS(10));
+                
+                if (bytes_read > 0) {
+                    // Check for radar data frame header and skip it - this is crucial!
+                    if (!found_header && idx + bytes_read >= 4) {
+                        // Check if we got a radar data frame instead of config ACK
+                        if (memcmp(instance->ack_buffer, LD2450_DATA_FRAME_HEADER, 4) == 0) {
+                            ESP_LOGW(TAG, "Received radar data frame instead of ACK, skipping");
+                            idx = 0; // Reset buffer, this isn't our ACK
+                            continue;
+                        }
+                    }
+                    
+                    idx += bytes_read;
+                    
+                    // Look for config header
+                    if (!found_header && idx >= 4) {
+                        if (memcmp(instance->ack_buffer, LD2450_CONFIG_FRAME_HEADER, 4) == 0) {
+                            found_header = true;
+                            ESP_LOGV(TAG, "Found ACK header");
+                        }
+                    }
+                    
+                    // Look for command echo
+                    if (found_header && !found_cmd_echo && idx >= 8) {
+                        if (instance->ack_buffer[6] == (cmd & 0xFF) && instance->ack_buffer[7] == 0x01) {
+                            found_cmd_echo = true;
+                            ESP_LOGV(TAG, "Found command echo in ACK");
+                        }
+                    }
+                    
+                    // Look for footer
+                    if (found_header && idx >= 12) { // Minimum ACK size with header, length, command, status and footer
+                        if (memcmp(&instance->ack_buffer[idx-4], LD2450_CONFIG_FRAME_FOOTER, 4) == 0) {
+                            found_footer = true;
+                            ESP_LOGV(TAG, "Found ACK footer");
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -136,9 +200,15 @@ esp_err_t ld2450_send_command(ld2450_cmd_t cmd, const void *value, size_t value_
     
     if (!found_header || !found_footer) {
         ESP_LOGE(TAG, "Failed to receive complete ACK for command %04x (got %d bytes)", cmd, idx);
+        
+        // Store error data for debugging
+        instance->error_buffer_len = idx > LD2450_ERROR_BUFFER_SIZE ? 
+                                     LD2450_ERROR_BUFFER_SIZE : idx;
         if (idx > 0) {
+            memcpy(instance->error_buffer, instance->ack_buffer, instance->error_buffer_len);
             ESP_LOG_BUFFER_HEX_LEVEL(TAG, instance->ack_buffer, idx, ESP_LOG_DEBUG);
         }
+        
         xSemaphoreGive(instance->mutex);
         return ESP_ERR_TIMEOUT;
     }
@@ -216,16 +286,26 @@ esp_err_t ld2450_enter_config_mode(void)
         return ESP_OK;
     }
     
+    // Set config mode flag first to pause normal data processing
+    instance->in_config_mode = true;
+    
+    // Allow time for processing task to respect the flag
+    vTaskDelay(pdMS_TO_TICKS(50));
+    
+    // Flush any pending data in UART buffer
+    uart_flush(instance->uart_port);
+    
     // Command value: 0x0001 (little-endian)
     uint8_t value[2] = {0x01, 0x00};
     esp_err_t ret = ld2450_send_command(LD2450_CMD_ENABLE_CONFIG, value, sizeof(value), 
                                        NULL, NULL, LD2450_CONFIG_TIMEOUT_MS);
     
     if (ret == ESP_OK) {
-        instance->in_config_mode = true;
         ESP_LOGI(TAG, "Entered configuration mode");
     } else {
         ESP_LOGE(TAG, "Failed to enter configuration mode: %s", esp_err_to_name(ret));
+        // Revert config mode flag on failure
+        instance->in_config_mode = false;
     }
     
     return ret;
@@ -374,32 +454,58 @@ esp_err_t ld2450_get_firmware_version(ld2450_firmware_version_t *version)
         return ret;
     }
     
-    // Query firmware version
-    ret = ld2450_send_command(LD2450_CMD_READ_FW_VERSION, NULL, 0, 
-                             ack_buffer, &ack_len, LD2450_CONFIG_TIMEOUT_MS);
+    // Allow extra settling time after entering config mode
+    vTaskDelay(pdMS_TO_TICKS(100));
     
-    if (ret == ESP_OK && ack_len >= 22) {  // Make sure we have enough data (header(4) + len(2) + cmd(2) + status(2) + fw_type(2) + main_ver(2) + sub_ver(4) + footer(4))
-        // Extract firmware version information based on protocol documentation
-        // Main version is at offset 12-13 (little-endian)
-        version->main_version = ack_buffer[12] | (ack_buffer[13] << 8);
+    // Flush any pending data in UART buffer before sending command
+    uart_flush(instance->uart_port);
+    
+    // Clear UART event queue to ensure no old events interfere
+    uart_event_t event;
+    while (xQueueReceive(instance->uart_queue, &event, 0) == pdTRUE) {
+        // Just drain the queue
+    }
+    
+    // Try up to 3 times with shorter timeout
+    for (int attempt = 0; attempt < 3; attempt++) {
+        ESP_LOGI(TAG, "Querying firmware version, attempt %d", attempt + 1);
         
-        // Sub-version is at offset 14-17 (little-endian)
-        version->sub_version = ack_buffer[14] | 
-                              (ack_buffer[15] << 8) | 
-                              ((uint32_t)ack_buffer[16] << 16) | 
-                              ((uint32_t)ack_buffer[17] << 24);
+        // Query firmware version with a shorter timeout (1 second instead of 3)
+        ret = ld2450_send_command(LD2450_CMD_READ_FW_VERSION, NULL, 0, 
+                                 ack_buffer, &ack_len, 1000);
         
-        // Format version string according to the protocol example (V1.02.22062416)
-        // Main version is split: lower byte is the first number, upper byte is after the first dot
-        snprintf(version->version_string, sizeof(version->version_string),
-                "V%u.%02u.%08lX", 
-                version->main_version & 0xFF,         // Lower byte of main version
-                (version->main_version >> 8) & 0xFF,  // Upper byte of main version
-                (unsigned long)version->sub_version); // Sub-version as a hex value
-        
-        ESP_LOGI(TAG, "Firmware version: %s", version->version_string);
-    } else {
-        ESP_LOGE(TAG, "Failed to read firmware version or invalid response");
+        if (ret == ESP_OK && ack_len >= 22) {
+            // Extract firmware version information based on protocol documentation
+            // Main version is at offset 12-13 (little-endian)
+            version->main_version = ack_buffer[12] | (ack_buffer[13] << 8);
+            
+            // Sub-version is at offset 14-17 (little-endian)
+            version->sub_version = ack_buffer[14] | 
+                                  (ack_buffer[15] << 8) | 
+                                  ((uint32_t)ack_buffer[16] << 16) | 
+                                  ((uint32_t)ack_buffer[17] << 24);
+            
+            // Format version string according to the protocol example (V1.02.22062416)
+            // Per protocol: high byte is first digit, low byte is digits after first dot
+            snprintf(version->version_string, sizeof(version->version_string),
+                    "V%u.%02u.%08lu", 
+                    (version->main_version >> 8) & 0xFF,  // High byte (0x01 -> 1)
+                    version->main_version & 0xFF,        // Low byte (0x02 -> 02)
+                    (unsigned long)version->sub_version); // Sub-version (0x22062416 -> 22062416)
+            
+            ESP_LOGI(TAG, "Firmware version: %s", version->version_string);
+            break; // Success, exit retry loop
+        } else {
+            ESP_LOGW(TAG, "Attempt %d failed, %s", attempt + 1, esp_err_to_name(ret));
+            // Short delay before retrying
+            vTaskDelay(pdMS_TO_TICKS(200));
+            // Flush UART again
+            uart_flush(instance->uart_port);
+        }
+    }
+    
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read firmware version after multiple attempts");
         ret = ESP_ERR_INVALID_RESPONSE;
     }
     

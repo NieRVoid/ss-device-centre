@@ -45,11 +45,17 @@ extern "C" {
 /** @brief Timeout for module restart in milliseconds */
 #define LD2450_RESTART_TIMEOUT_MS 3000
 
-/** @brief Size of the UART RX buffer (replaces CONFIG_LD2450_UART_RX_BUF_SIZE) */
-#define LD2450_UART_RX_BUF_SIZE 512
+/** @brief Size of the UART RX buffer */
+#define LD2450_UART_RX_BUF_SIZE 1024  // Increased from 512
 
 /** @brief Stack size for the processing task (replaces CONFIG_LD2450_TASK_STACK_SIZE) */
 #define LD2450_TASK_STACK_SIZE 4096
+
+/** @brief Always compute derived values (distance, angle) */
+#define LD2450_COMPUTE_DERIVED_VALUES 1
+
+/** @brief Error debug data buffer size */
+#define LD2450_ERROR_BUFFER_SIZE 256
 
 /** @brief MIN macro for getting minimum of two values */
 #ifndef MIN
@@ -67,6 +73,14 @@ static const uint8_t LD2450_DATA_FRAME_FOOTER[] = {0x55, 0xCC};
 static const uint8_t LD2450_CONFIG_FRAME_HEADER[] = {0xFD, 0xFC, 0xFB, 0xFA};
 /** @brief Config frame footer (0x04, 0x03, 0x02, 0x01) */
 static const uint8_t LD2450_CONFIG_FRAME_FOOTER[] = {0x04, 0x03, 0x02, 0x01};
+
+/**
+ * @brief Union for efficient frame header detection
+ */
+typedef union {
+    uint32_t value;
+    uint8_t bytes[4];
+} frame_header_t;
 
 /**
  * @brief Command words defined in the protocol
@@ -138,6 +152,17 @@ typedef struct {
     uint16_t frame_idx;
     /** @brief Frame synchronization state */
     bool frame_synced;
+    uint32_t idle_count;  // Counter for adaptive task delay
+    /** @brief Error debug data */
+    uint8_t error_buffer[LD2450_ERROR_BUFFER_SIZE];
+    size_t error_buffer_len;
+    
+    /** @brief Logging configuration */
+    ld2450_log_level_t log_level;
+    uint32_t data_log_interval_ms;
+    int64_t last_data_log_time;
+    ld2450_frame_t last_frame;
+    bool last_frame_valid;
 } ld2450_state_t;
 
 /**
@@ -192,9 +217,10 @@ void ld2450_processing_task(void *arg);
 /**
  * @brief UART event handler
  * 
- * @param event UART event data
+ * @param data_buffer Buffer containing UART data
+ * @param len Length of data in the buffer
  */
-void ld2450_uart_event_handler(void *arg);
+void ld2450_uart_event_handler(uint8_t *data_buffer, size_t len);
 
 /**
  * @brief Get driver instance (singleton)
@@ -221,6 +247,14 @@ esp_err_t ld2450_handle_data_frame(const uint8_t *data, size_t len);
  * @return esp_err_t ESP_OK on success, error code otherwise
  */
 esp_err_t ld2450_validate_ack(const uint8_t *ack, size_t len, ld2450_cmd_t cmd);
+
+/**
+ * @brief Format and log a radar data frame based on current log level
+ * 
+ * @param frame Pointer to frame data to log
+ * @param force Force logging regardless of interval
+ */
+void ld2450_log_radar_frame(const ld2450_frame_t *frame, bool force);
 
 #ifdef __cplusplus
 }

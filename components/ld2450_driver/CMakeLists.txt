@@ -1,4 +1,4 @@
-# components/ld2450-driver/CMakeLists.txt
+# components/ld2450_driver/CMakeLists.txt
 
 idf_component_register(
     SRCS

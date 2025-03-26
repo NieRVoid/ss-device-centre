@@ -5,6 +5,7 @@
  * Implementation of the remote control component using the mqtt_manager component
  * 
  * Updated to use the mqtt_manager component for MQTT operations.
+ * Optimized for memory efficiency.
  * 
  * @date 2025-03-20
  */
@@ -22,6 +23,15 @@
 
 static const char *TAG = "remote-control";
 
+// Replace macro with inline function for better maintainability
+static inline esp_err_t require_component_init(const char *name, bool condition) {
+    if (!condition) {
+        ESP_LOGE(TAG, "%s component must be initialized first", name);
+        return ESP_ERR_INVALID_STATE;
+    }
+    return ESP_OK;
+}
+
 // MQTT topic paths (suffixes added to prefix)
 #define TOPIC_STATUS "status"
 #define TOPIC_COMMAND "command"
@@ -33,14 +43,34 @@ static const char *TAG = "remote-control";
 #define CMD_STR_RESTART_DEVICE "restart"
 #define CMD_STR_CONFIG_UPDATE "config_update"
 
+// Memory tracking variables
+static size_t s_total_topics_memory = 0;
+static size_t s_total_user_props_memory = 0;
+
+// Topic buffer optimization
+#define MAX_TOPIC_LEN 64
+typedef struct {
+    char prefix[MAX_TOPIC_LEN];
+    char status_topic[MAX_TOPIC_LEN];
+    char command_topic[MAX_TOPIC_LEN];
+} topic_buffers_t;
+
 typedef struct {
     SemaphoreHandle_t mutex;
     esp_timer_handle_t report_timer;
+    
+    // Use pre-allocated buffer instead of dynamic allocation
+    topic_buffers_t topics;
+    bool using_static_topics;
+    
+    // Only use these pointers for dynamically allocated topics that exceed buffer size
     char *topic_prefix;
     char *status_topic;
     char *command_topic;
+    
     bool running;
     int command_handler_id;
+    int mqtt_connect_callback_id;
     
     // Callback functions and context
     remote_command_callback_t command_callback;
@@ -54,6 +84,7 @@ typedef struct {
     // User properties for MQTT messages
     mqtt_user_property_t *user_properties;
     int user_property_count;
+    bool owns_user_properties;
 } remote_control_t;
 
 static remote_control_t remote_control = {0};
@@ -67,6 +98,7 @@ static void mqtt_message_handler(const char *topic, int topic_len,
 static void mqtt_connect_handler(void *user_data);
 static void process_mqtt_command(const char *command_str, const char *payload, size_t payload_len);
 static remote_command_t parse_mqtt_command(const char *command);
+static esp_err_t prepare_topics(const char *prefix);
 
 /**
  * @brief Initialize the remote control component
@@ -80,6 +112,16 @@ esp_err_t remote_control_init(const remote_control_config_t *config)
     }
     
     ESP_LOGI(TAG, "Initializing remote control component");
+    
+    // Verify MQTT manager is initialized first
+    ret = require_component_init("MQTT Manager", mqtt_manager_is_initialized());
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    
+    // Reset memory tracking
+    s_total_topics_memory = 0;
+    s_total_user_props_memory = 0;
     
     // Create mutex for operations
     remote_control.mutex = xSemaphoreCreateMutex();
@@ -95,53 +137,43 @@ esp_err_t remote_control_init(const remote_control_config_t *config)
     remote_control.status_callback_ctx = config->status_callback_ctx;
     remote_control.status_interval_sec = config->status_interval_sec;
     
-    // Prepare topics
-    size_t prefix_len = strlen(config->topic_prefix);
+    // Initialize topic pointers to NULL
+    remote_control.topic_prefix = NULL;
+    remote_control.status_topic = NULL;
+    remote_control.command_topic = NULL;
+    remote_control.using_static_topics = false;
     
-    remote_control.topic_prefix = malloc(prefix_len + 1);
-    if (!remote_control.topic_prefix) {
-        ret = ESP_ERR_NO_MEM;
+    // Prepare topics (using static buffers when possible)
+    ret = prepare_topics(config->topic_prefix);
+    if (ret != ESP_OK) {
         goto cleanup;
     }
-    strcpy(remote_control.topic_prefix, config->topic_prefix);
-    
-    // Create full topic paths
-    size_t status_topic_len = prefix_len + strlen(TOPIC_STATUS) + 1; // +1 for '/'
-    remote_control.status_topic = malloc(status_topic_len + 1);      // +1 for null terminator
-    if (!remote_control.status_topic) {
-        ret = ESP_ERR_NO_MEM;
-        goto cleanup;
-    }
-    snprintf(remote_control.status_topic, status_topic_len + 1, "%s%s", 
-             config->topic_prefix, TOPIC_STATUS);
-    
-    size_t command_topic_len = prefix_len + strlen(TOPIC_COMMAND) + 1;
-    remote_control.command_topic = malloc(command_topic_len + 1);
-    if (!remote_control.command_topic) {
-        ret = ESP_ERR_NO_MEM;
-        goto cleanup;
-    }
-    snprintf(remote_control.command_topic, command_topic_len + 1, "%s%s", 
-             config->topic_prefix, TOPIC_COMMAND);
     
     // Store user properties
     if (config->user_properties && config->user_property_count > 0) {
-        remote_control.user_properties = malloc(config->user_property_count * sizeof(mqtt_user_property_t));
+        size_t props_size = config->user_property_count * sizeof(mqtt_user_property_t);
+        remote_control.user_properties = malloc(props_size);
         if (!remote_control.user_properties) {
             ret = ESP_ERR_NO_MEM;
             goto cleanup;
         }
-        memcpy(remote_control.user_properties, config->user_properties, 
-               config->user_property_count * sizeof(mqtt_user_property_t));
+        memcpy(remote_control.user_properties, config->user_properties, props_size);
         remote_control.user_property_count = config->user_property_count;
+        remote_control.owns_user_properties = true;
+        s_total_user_props_memory = props_size;
     } else {
         remote_control.user_properties = NULL;
         remote_control.user_property_count = 0;
+        remote_control.owns_user_properties = false;
     }
 
     // Log topic information
-    ESP_LOGI(TAG, "Status topic: %s", remote_control.status_topic);
-    ESP_LOGI(TAG, "Command topic: %s", remote_control.command_topic);
+    ESP_LOGI(TAG, "Status topic: %s", remote_control.using_static_topics ? 
+                                     remote_control.topics.status_topic : 
+                                     remote_control.status_topic);
+    ESP_LOGI(TAG, "Command topic: %s", remote_control.using_static_topics ? 
+                                      remote_control.topics.command_topic : 
+                                      remote_control.command_topic);
     
     // Ensure the MQTT manager is connected
     if (!mqtt_manager_is_connected()) {
@@ -163,14 +195,92 @@ esp_err_t remote_control_init(const remote_control_config_t *config)
     return ESP_OK;
     
 cleanup:
-    if (remote_control.topic_prefix) free(remote_control.topic_prefix);
-    if (remote_control.status_topic) free(remote_control.status_topic);
-    if (remote_control.command_topic) free(remote_control.command_topic);
-    if (remote_control.user_properties) free(remote_control.user_properties);
+    if (!remote_control.using_static_topics) {
+        if (remote_control.topic_prefix) {
+            free(remote_control.topic_prefix);
+            s_total_topics_memory -= strlen(remote_control.topic_prefix) + 1;
+        }
+        if (remote_control.status_topic) {
+            free(remote_control.status_topic);
+            s_total_topics_memory -= strlen(remote_control.status_topic) + 1;
+        }
+        if (remote_control.command_topic) {
+            free(remote_control.command_topic);
+            s_total_topics_memory -= strlen(remote_control.command_topic) + 1;
+        }
+    }
+    if (remote_control.user_properties && remote_control.owns_user_properties) {
+        free(remote_control.user_properties);
+        s_total_user_props_memory = 0;
+    }
     if (remote_control.mutex) vSemaphoreDelete(remote_control.mutex);
     if (remote_control.report_timer) esp_timer_delete(remote_control.report_timer);
     
     return ret;
+}
+
+/**
+ * @brief Prepare topic strings, using static buffers when possible
+ */
+static esp_err_t prepare_topics(const char *prefix)
+{
+    size_t prefix_len = strlen(prefix);
+    
+    // Try to use static buffers first
+    if (prefix_len < MAX_TOPIC_LEN - 10) { // Leave room for suffixes
+        // Use static buffers
+        remote_control.using_static_topics = true;
+        
+        // Copy prefix
+        strcpy(remote_control.topics.prefix, prefix);
+        
+        // Create full topic paths
+        snprintf(remote_control.topics.status_topic, MAX_TOPIC_LEN, "%s%s", 
+                 prefix, TOPIC_STATUS);
+        
+        snprintf(remote_control.topics.command_topic, MAX_TOPIC_LEN, "%s%s", 
+                 prefix, TOPIC_COMMAND);
+                 
+        return ESP_OK;
+    } 
+    
+    // Fall back to dynamic allocation for long topics
+    remote_control.using_static_topics = false;
+    
+    // Allocate topic strings
+    remote_control.topic_prefix = strdup(prefix);
+    if (!remote_control.topic_prefix) {
+        return ESP_ERR_NO_MEM;
+    }
+    s_total_topics_memory += prefix_len + 1;
+    
+    // Create full topic paths
+    size_t status_topic_len = prefix_len + strlen(TOPIC_STATUS) + 1; // +1 for '/'
+    remote_control.status_topic = malloc(status_topic_len + 1);      // +1 for null terminator
+    if (!remote_control.status_topic) {
+        free(remote_control.topic_prefix);
+        s_total_topics_memory -= prefix_len + 1;
+        return ESP_ERR_NO_MEM;
+    }
+    s_total_topics_memory += status_topic_len + 1;
+    
+    snprintf(remote_control.status_topic, status_topic_len + 1, "%s%s", 
+             prefix, TOPIC_STATUS);
+    
+    size_t command_topic_len = prefix_len + strlen(TOPIC_COMMAND) + 1;
+    remote_control.command_topic = malloc(command_topic_len + 1);
+    if (!remote_control.command_topic) {
+        free(remote_control.topic_prefix);
+        free(remote_control.status_topic);
+        s_total_topics_memory -= (prefix_len + 1 + status_topic_len + 1);
+        return ESP_ERR_NO_MEM;
+    }
+    s_total_topics_memory += command_topic_len + 1;
+    
+    snprintf(remote_control.command_topic, command_topic_len + 1, "%s%s", 
+             prefix, TOPIC_COMMAND);
+    
+    return ESP_OK;
 }
 
 /**
@@ -180,10 +290,15 @@ esp_err_t remote_control_start(void)
 {
     ESP_LOGI(TAG, "Starting remote control component");
     
+    // Get the appropriate command topic based on allocation type
+    const char *command_topic = remote_control.using_static_topics ? 
+                              remote_control.topics.command_topic : 
+                              remote_control.command_topic;
+    
     // Register for the command topic with MQTT manager
     int handler_id;
     esp_err_t ret = mqtt_manager_register_handler(
-        remote_control.command_topic,
+        command_topic,
         1, // QoS 1
         mqtt_message_handler,
         NULL,
@@ -245,15 +360,32 @@ static void mqtt_message_handler(const char *topic, int topic_len,
     ESP_LOGI(TAG, "Received message on topic: %.*s", topic_len, topic);
     ESP_LOGI(TAG, "Data: %.*s", data_len, data);
     
-    // Copy data to ensure null-termination
-    char *command = malloc(data_len + 1);
-    if (command) {
-        memcpy(command, data, data_len);
-        command[data_len] = '\0';
-        
-        // Process the command
-        process_mqtt_command(command, data, data_len);
-        
+    // Use stack buffer for small commands, heap for larger ones
+    char cmd_buf[64]; // Stack buffer for typical commands
+    char *command;
+    bool heap_allocated = false;
+    
+    if (data_len < sizeof(cmd_buf) - 1) {
+        // Use stack buffer
+        command = cmd_buf;
+    } else {
+        // Use heap for larger payloads
+        command = malloc(data_len + 1);
+        if (!command) {
+            ESP_LOGE(TAG, "Failed to allocate memory for command");
+            return;
+        }
+        heap_allocated = true;
+    }
+    
+    memcpy(command, data, data_len);
+    command[data_len] = '\0';
+    
+    // Process the command
+    process_mqtt_command(command, data, data_len);
+    
+    // Free heap-allocated buffer if used
+    if (heap_allocated) {
         free(command);
     }
 }
@@ -278,19 +410,26 @@ static void mqtt_connect_handler(void *user_data)
  */
 static remote_command_t parse_mqtt_command(const char *command)
 {
-    if (strcmp(command, CMD_STR_REQUEST_STATUS) == 0) {
-        return REMOTE_CMD_REQUEST_STATUS;
-    } else if (strcmp(command, CMD_STR_SET_OCCUPIED) == 0) {
-        return REMOTE_CMD_SET_OCCUPIED;
-    } else if (strcmp(command, CMD_STR_SET_VACANT) == 0) {
-        return REMOTE_CMD_SET_VACANT;
-    } else if (strcmp(command, CMD_STR_RESTART_DEVICE) == 0) {
-        return REMOTE_CMD_RESTART_DEVICE;
-    } else if (strcmp(command, CMD_STR_CONFIG_UPDATE) == 0) {
-        return REMOTE_CMD_CONFIG_UPDATE;
-    } else {
-        return REMOTE_CMD_UNKNOWN;
+    // Optimized version using lookup table approach
+    struct {
+        const char *cmd_str;
+        remote_command_t cmd_enum;
+    } cmd_map[] = {
+        {CMD_STR_REQUEST_STATUS, REMOTE_CMD_REQUEST_STATUS},
+        {CMD_STR_SET_OCCUPIED, REMOTE_CMD_SET_OCCUPIED},
+        {CMD_STR_SET_VACANT, REMOTE_CMD_SET_VACANT},
+        {CMD_STR_RESTART_DEVICE, REMOTE_CMD_RESTART_DEVICE},
+        {CMD_STR_CONFIG_UPDATE, REMOTE_CMD_CONFIG_UPDATE},
+        {NULL, REMOTE_CMD_UNKNOWN}
+    };
+    
+    for (int i = 0; cmd_map[i].cmd_str != NULL; i++) {
+        if (strcmp(command, cmd_map[i].cmd_str) == 0) {
+            return cmd_map[i].cmd_enum;
+        }
     }
+    
+    return REMOTE_CMD_UNKNOWN;
 }
 
 /**
@@ -335,73 +474,81 @@ static void report_timer_callback(void *arg)
 /**
  * @brief Internal function to publish room status
  */
- static esp_err_t publish_status_internal(const room_status_t *status)
- {
-     if (!mqtt_manager_is_connected() || status == NULL) {
-         return ESP_ERR_INVALID_STATE;
-     }
-     
-     // Take mutex to ensure thread safety
-     if (xSemaphoreTake(remote_control.mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
-         ESP_LOGW(TAG, "Failed to take mutex for publishing");
-         return ESP_ERR_TIMEOUT;
-     }
-     
-     // Convert room state to string
-     const char *state_str = "unknown";
-     switch (status->state) {
-         case ROOM_STATE_VACANT:
-             state_str = "vacant";
-             break;
-         case ROOM_STATE_OCCUPIED:
-             state_str = "occupied";
-             break;
-         default:
-             state_str = "unknown";
-             break;
-     }
-     
-     // Format status as JSON
-     char json_buffer[256];
-     snprintf(json_buffer, sizeof(json_buffer), 
-              "{"
-              "\"state\":\"%s\","
-              "\"count\":%d,"
-              "\"count_reliable\":%s,"
-              "\"source\":\"%s\","
-              "\"reliability\":%d,"
-              "\"timestamp\":%lld"
-              "}",
-              state_str,
-              status->occupant_count,
-              status->count_reliable ? "true" : "false",
-              status->source_name ? status->source_name : "unknown",
-              status->source_reliability,
-              esp_timer_get_time() / 1000 // microseconds to milliseconds
-     );
-     
-     // Publish the status using MQTT manager
-     ESP_LOGI(TAG, "Publishing status: %s", json_buffer);
-     int msg_id = mqtt_manager_publish(
-         remote_control.status_topic,
-         json_buffer, 
-         -1,  // use null-terminator
-         1,   // QoS 1
-         1,   // retain
-         remote_control.user_properties,  // user properties
-         remote_control.user_property_count
-     );
-     
-     xSemaphoreGive(remote_control.mutex);
-     
-     if (msg_id < 0) {
-         ESP_LOGE(TAG, "Failed to publish status");
-         return ESP_FAIL;
-     }
-     
-     ESP_LOGI(TAG, "Status published successfully, msg_id=%d", msg_id);
-     return ESP_OK;
- }
+static esp_err_t publish_status_internal(const room_status_t *status)
+{
+    if (!mqtt_manager_is_connected() || status == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    // Take mutex to ensure thread safety
+    if (xSemaphoreTake(remote_control.mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGW(TAG, "Failed to take mutex for publishing");
+        return ESP_ERR_TIMEOUT;
+    }
+    
+    // Convert room state to string (using constant strings to avoid allocations)
+    const char *state_str;
+    switch (status->state) {
+        case ROOM_STATE_VACANT:
+            state_str = "vacant";
+            break;
+        case ROOM_STATE_OCCUPIED:
+            state_str = "occupied";
+            break;
+        default:
+            state_str = "unknown";
+            break;
+    }
+    
+    // Get source name or default
+    const char *source = (status->source_name != NULL) ? status->source_name : "unknown";
+    
+    // Format status as JSON - use a reasonably sized buffer on stack
+    char json_buffer[256];
+    snprintf(json_buffer, sizeof(json_buffer), 
+             "{"
+             "\"state\":\"%s\","
+             "\"count\":%d,"
+             "\"count_reliable\":%s,"
+             "\"source\":\"%s\","
+             "\"reliability\":%d,"
+             "\"timestamp\":%lld"
+             "}",
+             state_str,
+             status->occupant_count,
+             status->count_reliable ? "true" : "false",
+             source,
+             status->source_reliability,
+             esp_timer_get_time() / 1000 // microseconds to milliseconds
+    );
+    
+    // Get appropriate status topic based on allocation type
+    const char *status_topic = remote_control.using_static_topics ? 
+                             remote_control.topics.status_topic : 
+                             remote_control.status_topic;
+    
+    // Publish the status using MQTT manager
+    ESP_LOGI(TAG, "Publishing status: %s", json_buffer);
+    int msg_id = mqtt_manager_publish(
+        status_topic,
+        json_buffer, 
+        -1,  // use null-terminator
+        1,   // QoS 1
+        1,   // retain
+        remote_control.user_properties,  // user properties
+        remote_control.user_property_count
+    );
+    
+    xSemaphoreGive(remote_control.mutex);
+    
+    if (msg_id < 0) {
+        ESP_LOGE(TAG, "Failed to publish status");
+        return ESP_FAIL;
+    }
+    
+    ESP_LOGI(TAG, "Status published successfully, msg_id=%d", msg_id);
+    return ESP_OK;
+}
 
 /**
  * @brief Publish room status update
@@ -425,6 +572,14 @@ esp_err_t remote_control_request_update(void)
 }
 
 /**
+ * @brief Get memory usage of the remote control component
+ */
+size_t remote_control_get_memory_usage(void)
+{
+    return s_total_topics_memory + s_total_user_props_memory;
+}
+
+/**
  * @brief Deinitialize the remote control component
  */
 esp_err_t remote_control_deinit(void)
@@ -433,12 +588,40 @@ esp_err_t remote_control_deinit(void)
     esp_err_t ret = remote_control_stop();
     
     // Clean up resources
-    if (remote_control.topic_prefix) free(remote_control.topic_prefix);
-    if (remote_control.status_topic) free(remote_control.status_topic);
-    if (remote_control.command_topic) free(remote_control.command_topic);
-    if (remote_control.user_properties) free(remote_control.user_properties);
-    if (remote_control.mutex) vSemaphoreDelete(remote_control.mutex);
-    if (remote_control.report_timer) esp_timer_delete(remote_control.report_timer);
+    if (!remote_control.using_static_topics) {
+        if (remote_control.topic_prefix) {
+            free(remote_control.topic_prefix);
+            remote_control.topic_prefix = NULL;
+        }
+        if (remote_control.status_topic) {
+            free(remote_control.status_topic);
+            remote_control.status_topic = NULL;
+        }
+        if (remote_control.command_topic) {
+            free(remote_control.command_topic);
+            remote_control.command_topic = NULL;
+        }
+    }
+    
+    if (remote_control.user_properties && remote_control.owns_user_properties) {
+        free(remote_control.user_properties);
+        s_total_user_props_memory = 0;
+    }
+    remote_control.user_properties = NULL;
+    
+    if (remote_control.mutex) {
+        vSemaphoreDelete(remote_control.mutex);
+        remote_control.mutex = NULL;
+    }
+    
+    if (remote_control.report_timer) {
+        esp_timer_delete(remote_control.report_timer);
+        remote_control.report_timer = NULL;
+    }
+    
+    // Reset memory tracking
+    s_total_topics_memory = 0;
+    s_total_user_props_memory = 0;
     
     // Zero out the structure
     memset(&remote_control, 0, sizeof(remote_control_t));
